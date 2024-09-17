@@ -56,7 +56,7 @@ pub struct RisingWaveConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -97,7 +97,7 @@ impl GenerateConfig for RisingWaveConfig {
 #[typetag::serde(name = "risingwave")]
 impl SinkConfig for RisingWaveConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let request_settings = self.request.unwrap_with(&TowerRequestConfig::default());
+        let request_settings = self.request.into_settings();
         let service = RisingWaveService::try_new(self).await?;
         let client = Arc::clone(&service.client);
 

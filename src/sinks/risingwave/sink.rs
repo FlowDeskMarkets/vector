@@ -17,7 +17,7 @@ impl RisingWaveSink {
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let batcher_settings = self
             .batch_settings
-            .into_item_size_config(RisingWaveBatchSizer {
+            .as_item_size_config(RisingWaveBatchSizer {
                 encoder: self.encoder.clone(),
             });
         let transformer = self.transformer;
