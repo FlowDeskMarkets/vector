@@ -1,15 +1,10 @@
 use std::{sync::Arc, task::Poll};
 
+use crate::sinks::prelude::*;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use tokio_postgres::{Client, Error as RisingWaveError, NoTls};
 use tower::Service;
-use vector_common::{
-    config::ComponentKey,
-    finalization::{EventFinalizers, EventStatus, Finalizable},
-    request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
-};
-use vector_core::{config::DataType, stream::DriverResponse};
 
 use crate::sinks::prelude::RetryLogic;
 
