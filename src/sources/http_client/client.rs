@@ -5,8 +5,10 @@ use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures_util::FutureExt;
 use http::{response::Parts, Uri};
+use regex::Regex;
 use serde_with::serde_as;
 use snafu::ResultExt;
+use std::sync::LazyLock;
 use std::{collections::HashMap, time::Duration};
 use tokio_util::codec::Decoder as _;
 
@@ -32,10 +34,17 @@ use vector_lib::codecs::{
     decoding::{DeserializerConfig, FramingConfig},
     StreamDecodingError,
 };
+use vector_lib::config::{log_schema, LogNamespace, SourceOutput};
 use vector_lib::configurable::configurable_component;
 use vector_lib::{
-    config::{log_schema, LogNamespace, SourceOutput},
-    event::Event,
+    compile_vrl,
+    event::{Event, LogEvent, VrlTarget},
+    TimeZone,
+};
+use vrl::{
+    compiler::{runtime::Runtime, CompileConfig},
+    core::Value,
+    prelude::TypeState,
 };
 
 /// Configuration for the `http_client` source.
@@ -178,16 +187,63 @@ impl Default for HttpClientConfig {
 
 impl_generate_config_from_default!(HttpClientConfig);
 
+fn process_vrl(query_str: &str) -> Option<String> {
+    let functions = vrl::stdlib::all()
+        .into_iter()
+        .chain(vector_lib::enrichment::vrl_functions())
+        .chain(vector_vrl_functions::all())
+        .collect::<Vec<_>>();
+
+    let state = TypeState::default();
+    let mut config = CompileConfig::default();
+    config.set_read_only();
+
+    let raw_vrl_string = RE.replace_all(query_str, |caps: &regex::Captures| {
+        let expression = &caps[1];
+        expression.to_string()
+    });
+
+    if let Ok(compiled) = compile_vrl(&raw_vrl_string, &functions, &state, config) {
+        let program = compiled.program;
+
+        let mut target = VrlTarget::new(
+            Event::Log(LogEvent::from(Value::from(raw_vrl_string))),
+            program.info(),
+            false,
+        );
+
+        let timezone = TimeZone::default();
+        if let Ok(value) = Runtime::default().resolve(&mut target, &program, &timezone) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(?P<key>[^\}]+)\}\}").unwrap());
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "http_client")]
 impl SourceConfig for HttpClientConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
-        // build the url
+        let mut processed_query = self.query.clone();
+        for (param_name, query_value) in self.query.iter() {
+            match query_value {
+                QueryParameterValue::SingleParam(param) => {
+                    self.process_single_param(param_name, param, &mut processed_query);
+                }
+                QueryParameterValue::MultiParams(params) => {
+                    self.process_multi_params(param_name, params, &mut processed_query);
+                }
+            }
+        }
+
+        // Build the URL with the processed query parameters
         let endpoints = [self.endpoint.clone()];
         let urls = endpoints
             .iter()
             .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
-            .map(|r| r.map(|uri| build_url(&uri, &self.query)))
+            .map(|r| r.map(|uri| build_url(&uri, &processed_query)))
             .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
 
         let tls = TlsSettings::from_options(self.tls.as_ref())?;
@@ -251,6 +307,49 @@ impl HttpClientConfig {
             log_namespace.unwrap_or_else(|| self.log_namespace.unwrap_or(false).into());
 
         DecodingConfig::new(framing, decoding, log_namespace)
+    }
+
+    fn process_single_param(
+        &self,
+        param_name: &str,
+        param: &str,
+        processed_query: &mut HashMap<String, QueryParameterValue>,
+    ) {
+        let processed_param = self.parse_param(param);
+        processed_query.insert(
+            param_name.to_string(),
+            QueryParameterValue::SingleParam(processed_param),
+        );
+    }
+
+    fn process_multi_params(
+        &self,
+        param_name: &str,
+        params: &[String],
+        processed_query: &mut HashMap<String, QueryParameterValue>,
+    ) {
+        let processed_params: Vec<String> =
+            params.iter().map(|param| self.parse_param(param)).collect();
+
+        processed_query.insert(
+            param_name.to_string(),
+            QueryParameterValue::MultiParams(processed_params),
+        );
+    }
+
+    /// Parse the parameter and resolve any VRL functions within
+    fn parse_param(&self, param: &str) -> String {
+        let mut parsed_param = param.to_string();
+
+        for cap in RE.captures_iter(param) {
+            if let Some(key) = cap.name("key") {
+                let key_value = process_vrl(key.as_str())
+                    .unwrap_or_else(|| panic!("Failed to process VRL for key: {}", key.as_str()));
+
+                parsed_param = parsed_param.replace(&cap[0], &key_value);
+            }
+        }
+        parsed_param
     }
 }
 
