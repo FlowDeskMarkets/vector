@@ -90,7 +90,9 @@ pub(crate) fn build_url(uri: &Uri, query: &QueryParameters) -> Uri {
     };
     for (k, l) in query {
         for v in l {
-            serializer.append_pair(k, v);
+            // Remove quotes from string
+            let clean_value = v.replace('"', "");
+            serializer.append_pair(k, &clean_value);
         }
     }
     let mut builder = Uri::builder();

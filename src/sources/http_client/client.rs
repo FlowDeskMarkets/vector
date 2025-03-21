@@ -220,7 +220,7 @@ fn process_vrl(query_str: &str) -> Option<String> {
     None
 }
 
-static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(?P<key>[^\}]+)\}\}").unwrap());
+static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(?P<key>.+)\}\}").unwrap());
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "http_client")]
