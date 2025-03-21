@@ -344,7 +344,7 @@ impl HttpClientConfig {
         for cap in RE.captures_iter(param) {
             if let Some(key) = cap.name("key") {
                 let key_value = process_vrl(key.as_str())
-                    .unwrap_or_else(|| panic!("Failed to process VRL for key: {}", key.as_str()));
+                    .unwrap_or_else(|| panic!("Failed to process VRL"));
 
                 parsed_param = parsed_param.replace(&cap[0], &key_value);
             }
