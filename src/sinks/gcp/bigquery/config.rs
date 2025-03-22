@@ -56,6 +56,15 @@ pub struct BigqueryConfig {
     #[configurable(metadata(docs::examples = "https://bigquerystorage.googleapis.com:443"))]
     pub endpoint: String,
 
+    /// Whether to use pending streams for batch loading.
+    /// 
+    /// When enabled, Vector will create streams in pending type, append rows in batches,
+    /// finalize the streams, and then commit them in batches. This can improve performance
+    /// and reduce costs for high-volume data ingestion.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "true", docs::examples = "false"))]
+    pub use_pending_streams: bool,
+
     #[serde(default, flatten)]
     pub auth: GcpAuthConfig,
 
@@ -81,13 +90,26 @@ pub struct BigqueryConfig {
 }
 
 impl BigqueryConfig {
-    fn get_write_stream(&self) -> String {
-        // TODO: support non-default streams
-        // https://cloud.google.com/bigquery/docs/write-api#application-created_streams
+    fn get_parent_path(&self) -> String {
         format!(
-            "projects/{}/datasets/{}/tables/{}/streams/_default",
+            "projects/{}/datasets/{}/tables/{}",
             self.project, self.dataset, self.table
         )
+    }
+
+    fn get_default_write_stream(&self) -> String {
+        format!("{}/streams/_default", self.get_parent_path())
+    }
+
+    fn get_write_stream(&self) -> String {
+        if self.use_pending_streams {
+            // For pending streams, return just the parent path
+            // Actual stream ID will be created by the service
+            self.get_parent_path()
+        } else {
+            // For default stream
+            self.get_default_write_stream()
+        }
     }
 }
 
@@ -109,6 +131,7 @@ async fn healthcheck_future(
     uri: Uri,
     auth: GcpAuthenticator,
     write_stream: String,
+    use_pending_streams: bool,
 ) -> crate::Result<()> {
     let channel = Channel::builder(uri)
         .tls_config(tonic::transport::channel::ClientTlsConfig::new())
@@ -120,21 +143,50 @@ async fn healthcheck_future(
         channel,
         AuthInterceptor { auth },
     );
-    // specify the write_stream so that there's enough information to perform an IAM check
-    let stream = tokio_stream::once(proto::AppendRowsRequest {
-        write_stream,
-        ..proto::AppendRowsRequest::default()
-    });
-    let mut response = client.append_rows(stream).await?;
-    // the result is expected to be `InvalidArgument`
-    // because we use a bunch of empty values in the request
-    // (and `InvalidArgument` specifically means we made it past the auth check)
-    if let Err(status) = response.get_mut().message().await {
-        if status.code() != tonic::Code::InvalidArgument {
-            return Err(status.into());
+    
+    if use_pending_streams {
+        // For pending streams, test permissions by attempting to create a write stream
+        let request = proto::CreateWriteStreamRequest {
+            parent: write_stream,
+            write_stream: Some(proto::WriteStream {
+                name: String::new(),
+                type_: proto::WriteStream::Type::Pending.into(),
+                create_time: None,
+                commit_time: None,
+                table_schema: None,
+            }),
+        };
+        let response = client.create_write_stream(request).await;
+        // The result might be an error due to permissions or schema issues, but we're just testing auth
+        match response {
+            Ok(_) => Ok(()),
+            Err(status) => {
+                if status.code() == tonic::Code::InvalidArgument || status.code() == tonic::Code::AlreadyExists {
+                    // We successfully authenticated, but the request had invalid arguments
+                    Ok(())
+                } else {
+                    Err(status.into())
+                }
+            }
         }
+    } else {
+        // For default stream, test as before
+        // specify the write_stream so that there's enough information to perform an IAM check
+        let stream = tokio_stream::once(proto::AppendRowsRequest {
+            write_stream,
+            ..proto::AppendRowsRequest::default()
+        });
+        let mut response = client.append_rows(stream).await?;
+        // the result is expected to be `InvalidArgument`
+        // because we use a bunch of empty values in the request
+        // (and `InvalidArgument` specifically means we made it past the auth check)
+        if let Err(status) = response.get_mut().message().await {
+            if status.code() != tonic::Code::InvalidArgument {
+                return Err(status.into());
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -154,6 +206,7 @@ impl SinkConfig for BigqueryConfig {
                 self.endpoint.parse()?,
                 auth.clone(),
                 self.get_write_stream(),
+                self.use_pending_streams,
             )
             .boxed()
         } else {
@@ -178,12 +231,15 @@ impl SinkConfig for BigqueryConfig {
         let request_builder = BigqueryRequestBuilder {
             protobuf_serializer,
             write_stream,
+            use_pending_streams: self.use_pending_streams,
         };
 
         let sink = BigquerySink {
             service,
             batcher_settings,
             request_builder,
+            use_pending_streams: self.use_pending_streams,
+            parent_path: self.get_parent_path(),
         };
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }

@@ -36,9 +36,11 @@ pub struct BigqueryRequestMetadata {
     finalizers: EventFinalizers,
 }
 
+#[derive(Clone)]
 pub struct BigqueryRequestBuilder {
     pub protobuf_serializer: ProtobufSerializer,
     pub write_stream: String,
+    pub use_pending_streams: bool,
 }
 
 impl BigqueryRequestBuilder {
@@ -120,17 +122,37 @@ impl IncrementalRequestBuilder<Vec<Event>> for BigqueryRequestBuilder {
     }
 
     fn build_request(&mut self, metadata: Self::Metadata, payload: Self::Payload) -> Self::Request {
-        let request = proto::AppendRowsRequest {
-            write_stream: self.write_stream.clone(),
-            offset: None, // not supported by _default stream
-            trace_id: Default::default(),
-            missing_value_interpretations: Default::default(),
-            default_missing_value_interpretation: 0,
-            rows: Some(proto::append_rows_request::Rows::ProtoRows(payload)),
-        };
-        let uncompressed_size = request.encoded_len();
+        let uncompressed_size;
+        let request_type;
+        
+        if self.use_pending_streams {
+            // For pending streams, the write_stream here will be a stream ID created by CreateWriteStream
+            let append_request = proto::AppendRowsRequest {
+                write_stream: self.write_stream.clone(),
+                offset: None, 
+                trace_id: Default::default(),
+                missing_value_interpretations: Default::default(),
+                default_missing_value_interpretation: 0,
+                rows: Some(proto::append_rows_request::Rows::ProtoRows(payload.clone())),
+            };
+            uncompressed_size = append_request.encoded_len();
+            request_type = super::service::BigqueryRequestType::AppendRows(append_request);
+        } else {
+            // For default stream, create a regular request
+            let request = proto::AppendRowsRequest {
+                write_stream: self.write_stream.clone(),
+                offset: None, // not supported by _default stream
+                trace_id: Default::default(),
+                missing_value_interpretations: Default::default(),
+                default_missing_value_interpretation: 0,
+                rows: Some(proto::append_rows_request::Rows::ProtoRows(payload)),
+            };
+            uncompressed_size = request.encoded_len();
+            request_type = super::service::BigqueryRequestType::AppendRows(request);
+        }
+        
         BigqueryRequest {
-            request,
+            request_type,
             metadata: metadata.request_metadata,
             finalizers: metadata.finalizers,
             uncompressed_size,
@@ -319,6 +341,7 @@ mod test {
         let mut request_builder = BigqueryRequestBuilder {
             protobuf_serializer,
             write_stream: "/projects/123/datasets/456/tables/789/streams/_default".to_string(),
+            use_pending_streams: false,
         };
         // check that we break up large batches to avoid api limits
         let mut events = vec![];

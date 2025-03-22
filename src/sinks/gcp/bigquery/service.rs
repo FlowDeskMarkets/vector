@@ -32,8 +32,15 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
+pub enum BigqueryRequestType {
+    AppendRows(proto::AppendRowsRequest),
+    CreateWriteStream(proto::CreateWriteStreamRequest),
+    FinalizeWriteStream(proto::FinalizeWriteStreamRequest),
+    BatchCommitWriteStreams(proto::BatchCommitWriteStreamsRequest),
+}
+
 pub struct BigqueryRequest {
-    pub request: proto::AppendRowsRequest,
+    pub request_type: BigqueryRequestType,
     pub metadata: RequestMetadata,
     pub finalizers: EventFinalizers,
     pub uncompressed_size: usize,
@@ -56,36 +63,66 @@ impl MetaDescriptive for BigqueryRequest {
 }
 
 #[derive(Debug)]
+pub enum BigqueryResponseBody {
+    AppendRows(proto::AppendRowsResponse),
+    CreateWriteStream(proto::WriteStream),
+    FinalizeWriteStream(proto::FinalizeWriteStreamResponse),
+    BatchCommitWriteStreams(proto::BatchCommitWriteStreamsResponse),
+}
+
+
+#[derive(Debug)]
 pub struct BigqueryResponse {
-    body: proto::AppendRowsResponse,
+    body: BigqueryResponseBody,
     request_byte_size: GroupedCountByteSize,
     request_uncompressed_size: usize,
 }
 
 impl DriverResponse for BigqueryResponse {
     fn event_status(&self) -> EventStatus {
-        if !self.body.row_errors.is_empty() {
-            // The AppendRowsResponse reports on specific rows that failed to append,
-            // meaning that in theory on failures we can retry the request without the bad events.
-            // Unfortunately there's no good mechanism for doing this in the Vector model;
-            // it's assumed either the whole thing is successful or it is not.
-            return EventStatus::Rejected;
-        }
-        match &self.body.response {
-            None => EventStatus::Dropped,
-            Some(proto::append_rows_response::Response::AppendResult(_)) => EventStatus::Delivered,
-            Some(proto::append_rows_response::Response::Error(status)) => {
-                match super::proto::third_party::google::rpc::Code::try_from(status.code) {
-                    // we really shouldn't be able to get here, but just in case
-                    Ok(super::proto::third_party::google::rpc::Code::Ok) => EventStatus::Delivered,
-                    // these errors can't be retried because the event payload is almost definitely bad
-                    Ok(super::proto::third_party::google::rpc::Code::InvalidArgument)
-                    | Ok(super::proto::third_party::google::rpc::Code::NotFound)
-                    | Ok(super::proto::third_party::google::rpc::Code::AlreadyExists) => {
-                        EventStatus::Rejected
+        match &self.body {
+            BigqueryResponseBody::AppendRows(body) => {
+                if !body.row_errors.is_empty() {
+                    // The AppendRowsResponse reports on specific rows that failed to append,
+                    // meaning that in theory on failures we can retry the request without the bad events.
+                    // Unfortunately there's no good mechanism for doing this in the Vector model;
+                    // it's assumed either the whole thing is successful or it is not.
+                    return EventStatus::Rejected;
+                }
+                match &body.response {
+                    None => EventStatus::Dropped,
+                    Some(proto::append_rows_response::Response::AppendResult(_)) => EventStatus::Delivered,
+                    Some(proto::append_rows_response::Response::Error(status)) => {
+                        match super::proto::third_party::google::rpc::Code::try_from(status.code) {
+                            // we really shouldn't be able to get here, but just in case
+                            Ok(super::proto::third_party::google::rpc::Code::Ok) => EventStatus::Delivered,
+                            // these errors can't be retried because the event payload is almost definitely bad
+                            Ok(super::proto::third_party::google::rpc::Code::InvalidArgument)
+                            | Ok(super::proto::third_party::google::rpc::Code::NotFound)
+                            | Ok(super::proto::third_party::google::rpc::Code::AlreadyExists) => {
+                                EventStatus::Rejected
+                            }
+                            // everything else can probably be retried
+                            _ => EventStatus::Errored,
+                        }
                     }
-                    // everything else can probably be retried
-                    _ => EventStatus::Errored,
+                }
+            }
+            BigqueryResponseBody::CreateWriteStream(_) => {
+                // Creating a write stream is a success if we get here
+                EventStatus::Delivered
+            }
+            BigqueryResponseBody::FinalizeWriteStream(_) => {
+                // Finalizing a write stream is a success if we get here
+                EventStatus::Delivered
+            }
+            BigqueryResponseBody::BatchCommitWriteStreams(response) => {
+                // Check if there are any stream errors
+                if !response.stream_errors.is_empty() {
+                    // If any streams failed to commit, mark as error so we can retry
+                    EventStatus::Errored
+                } else {
+                    EventStatus::Delivered
                 }
             }
         }
@@ -106,6 +143,12 @@ pub enum BigqueryServiceError {
     Request { status: tonic::Status },
     #[snafu(display("BigQuery row write failures: {:?}", row_errors))]
     RowWrite { row_errors: Vec<proto::RowError> },
+    #[snafu(display("Stream creation failed: {}", message))]
+    StreamCreation { message: String },
+    #[snafu(display("Stream finalization failed: {}", message))]
+    StreamFinalization { message: String },
+    #[snafu(display("Batch commit failed with errors: {:?}", stream_errors))]
+    BatchCommit { stream_errors: Vec<proto::StorageError> },
 }
 
 impl From<tonic::transport::Error> for BigqueryServiceError {
@@ -159,33 +202,122 @@ impl Service<BigqueryRequest> for BigqueryService {
         let request_uncompressed_size = request.uncompressed_size;
 
         let mut client = self.service.clone();
+        let request_type = std::mem::replace(&mut request.request_type, 
+            BigqueryRequestType::AppendRows(proto::AppendRowsRequest::default()));
 
         Box::pin(async move {
             // Ideally, we would maintain the gRPC stream, detect when auth expired and re-request with new auth.
             // But issuing a new request every time leads to more comprehensible code with reasonable performance.
-            trace!(
-                message = "Sending request to BigQuery",
-                request = format!("{:?}", request.request),
-            );
-            let stream = tokio_stream::once(request.request);
-            let response = client.append_rows(stream).await?;
-            match response.into_inner().message().await? {
-                Some(body) => {
+            match request_type {
+                BigqueryRequestType::AppendRows(append_request) => {
                     trace!(
-                        message = "Received response body from BigQuery",
-                        body = format!("{:?}", body),
+                        message = "Sending AppendRows request to BigQuery",
+                        request = format!("{:?}", append_request),
                     );
-                    if body.row_errors.is_empty() {
-                        Ok(BigqueryResponse {
-                            body,
-                            request_byte_size,
-                            request_uncompressed_size,
-                        })
-                    } else {
-                        Err(body.row_errors.into())
+                    let stream = tokio_stream::once(append_request);
+                    let response = client.append_rows(stream).await?;
+                    match response.into_inner().message().await? {
+                        Some(body) => {
+                            trace!(
+                                message = "Received AppendRows response body from BigQuery",
+                                body = format!("{:?}", body),
+                            );
+                            if body.row_errors.is_empty() {
+                                Ok(BigqueryResponse {
+                                    body: BigqueryResponseBody::AppendRows(body),
+                                    request_byte_size,
+                                    request_uncompressed_size,
+                                })
+                            } else {
+                                Err(body.row_errors.into())
+                            }
+                        }
+                        None => Err(tonic::Status::unknown("response stream closed").into()),
+                    }
+                },
+                BigqueryRequestType::CreateWriteStream(create_request) => {
+                    trace!(
+                        message = "Sending CreateWriteStream request to BigQuery",
+                        request = format!("{:?}", create_request),
+                    );
+                    
+                    match client.create_write_stream(create_request).await {
+                        Ok(response) => {
+                            let body = response.into_inner();
+                            trace!(
+                                message = "Received CreateWriteStream response from BigQuery",
+                                body = format!("{:?}", body),
+                            );
+                            Ok(BigqueryResponse {
+                                body: BigqueryResponseBody::CreateWriteStream(body),
+                                request_byte_size,
+                                request_uncompressed_size,
+                            })
+                        },
+                        Err(status) => {
+                            Err(BigqueryServiceError::StreamCreation { 
+                                message: format!("CreateWriteStream failed: {}", status) 
+                            })
+                        }
+                    }
+                },
+                BigqueryRequestType::FinalizeWriteStream(finalize_request) => {
+                    trace!(
+                        message = "Sending FinalizeWriteStream request to BigQuery",
+                        request = format!("{:?}", finalize_request),
+                    );
+                    
+                    match client.finalize_write_stream(finalize_request).await {
+                        Ok(response) => {
+                            let body = response.into_inner();
+                            trace!(
+                                message = "Received FinalizeWriteStream response from BigQuery",
+                                body = format!("{:?}", body),
+                            );
+                            Ok(BigqueryResponse {
+                                body: BigqueryResponseBody::FinalizeWriteStream(body),
+                                request_byte_size,
+                                request_uncompressed_size,
+                            })
+                        },
+                        Err(status) => {
+                            Err(BigqueryServiceError::StreamFinalization { 
+                                message: format!("FinalizeWriteStream failed: {}", status) 
+                            })
+                        }
+                    }
+                },
+                BigqueryRequestType::BatchCommitWriteStreams(commit_request) => {
+                    trace!(
+                        message = "Sending BatchCommitWriteStreams request to BigQuery",
+                        request = format!("{:?}", commit_request),
+                    );
+                    
+                    match client.batch_commit_write_streams(commit_request).await {
+                        Ok(response) => {
+                            let body = response.into_inner();
+                            trace!(
+                                message = "Received BatchCommitWriteStreams response from BigQuery",
+                                body = format!("{:?}", body),
+                            );
+                            
+                            if !body.stream_errors.is_empty() {
+                                Err(BigqueryServiceError::BatchCommit { 
+                                    stream_errors: body.stream_errors 
+                                })
+                            } else {
+                                Ok(BigqueryResponse {
+                                    body: BigqueryResponseBody::BatchCommitWriteStreams(body),
+                                    request_byte_size,
+                                    request_uncompressed_size,
+                                })
+                            }
+                        },
+                        Err(status) => {
+                            Err(BigqueryServiceError::Request { status })
+                        }
                     }
                 }
-                None => Err(tonic::Status::unknown("response stream closed").into()),
             }
         })
     }
@@ -256,21 +388,49 @@ mod test {
             &self,
             _request: Request<proto::GetWriteStreamRequest>,
         ) -> std::result::Result<Response<proto::WriteStream>, Status> {
-            unimplemented!()
+            // Mock implementation for testing
+            Ok(Response::new(proto::WriteStream {
+                name: "test_stream".to_string(),
+                type_: proto::WriteStream::Type::Pending.into(),
+                create_time: None,
+                commit_time: None,
+                table_schema: None,
+            }))
+        }
+
+        async fn create_write_stream(
+            &self,
+            _request: Request<proto::CreateWriteStreamRequest>,
+        ) -> std::result::Result<Response<proto::WriteStream>, Status> {
+            // Mock implementation for testing
+            Ok(Response::new(proto::WriteStream {
+                name: "test_pending_stream".to_string(),
+                type_: proto::WriteStream::Type::Pending.into(),
+                create_time: None,
+                commit_time: None,
+                table_schema: None,
+            }))
         }
 
         async fn finalize_write_stream(
             &self,
             _request: Request<proto::FinalizeWriteStreamRequest>,
         ) -> std::result::Result<Response<proto::FinalizeWriteStreamResponse>, Status> {
-            unimplemented!()
+            // Mock implementation for testing
+            Ok(Response::new(proto::FinalizeWriteStreamResponse {
+                row_count: 100,
+            }))
         }
 
         async fn batch_commit_write_streams(
             &self,
             _request: Request<proto::BatchCommitWriteStreamsRequest>,
         ) -> std::result::Result<Response<proto::BatchCommitWriteStreamsResponse>, Status> {
-            unimplemented!()
+            // Mock implementation for testing
+            Ok(Response::new(proto::BatchCommitWriteStreamsResponse {
+                commit_time: None,
+                stream_errors: vec![],
+            }))
         }
 
         async fn flush_rows(
@@ -345,21 +505,26 @@ mod test {
                 .is_ready());
             let response = service
                 .call(BigqueryRequest {
-                    request: proto::AppendRowsRequest {
+                    request_type: BigqueryRequestType::AppendRows(proto::AppendRowsRequest {
                         write_stream: "test".to_string(),
                         offset: None,
                         trace_id: "".to_string(),
                         missing_value_interpretations: Default::default(),
                         default_missing_value_interpretation: 0,
                         rows: None,
-                    },
+                    }),
                     metadata: Default::default(),
                     finalizers: Default::default(),
                     uncompressed_size: 1,
                 })
                 .await
                 .unwrap();
-            assert_eq!("ack", response.body.write_stream);
+            
+            if let BigqueryResponseBody::AppendRows(body) = response.body {
+                assert_eq!("ack", body.write_stream);
+            } else {
+                panic!("Expected AppendRows response");
+            }
         });
         // validate the request
         let (request, responder) = receiver.recv().await.unwrap();
@@ -378,6 +543,90 @@ mod test {
         // clean everything up
         shutdown.send(()).unwrap();
         client_future.await.unwrap();
+        server_future.await.unwrap();
+    }
+    
+    #[tokio::test]
+    async fn bigquery_pending_streams() {
+        let (mut service, _receiver, shutdown, server_future) = run_server().await;
+        
+        // Test CreateWriteStream
+        let create_future = tokio::spawn(async move {
+            let response = service
+                .call(BigqueryRequest {
+                    request_type: BigqueryRequestType::CreateWriteStream(proto::CreateWriteStreamRequest {
+                        parent: "projects/test/datasets/test/tables/test".to_string(),
+                        write_stream: Some(proto::WriteStream {
+                            name: String::new(),
+                            type_: proto::WriteStream::Type::Pending.into(),
+                            create_time: None,
+                            commit_time: None,
+                            table_schema: None,
+                        }),
+                    }),
+                    metadata: Default::default(),
+                    finalizers: Default::default(),
+                    uncompressed_size: 1,
+                })
+                .await
+                .unwrap();
+            
+            if let BigqueryResponseBody::CreateWriteStream(stream) = response.body {
+                assert_eq!("test_pending_stream", stream.name);
+                assert_eq!(proto::WriteStream::Type::Pending as i32, stream.type_);
+            } else {
+                panic!("Expected CreateWriteStream response");
+            }
+            
+            // Test FinalizeWriteStream
+            let mut service2 = service.clone();
+            let response = service2
+                .call(BigqueryRequest {
+                    request_type: BigqueryRequestType::FinalizeWriteStream(proto::FinalizeWriteStreamRequest {
+                        name: "test_pending_stream".to_string(),
+                    }),
+                    metadata: Default::default(),
+                    finalizers: Default::default(),
+                    uncompressed_size: 1,
+                })
+                .await
+                .unwrap();
+            
+            if let BigqueryResponseBody::FinalizeWriteStream(result) = response.body {
+                assert_eq!(100, result.row_count);
+            } else {
+                panic!("Expected FinalizeWriteStream response");
+            }
+            
+            // Test BatchCommitWriteStreams
+            let mut service3 = service.clone();
+            let response = service3
+                .call(BigqueryRequest {
+                    request_type: BigqueryRequestType::BatchCommitWriteStreams(
+                        proto::BatchCommitWriteStreamsRequest {
+                            parent: "projects/test/datasets/test/tables/test".to_string(),
+                            write_streams: vec!["test_pending_stream".to_string()],
+                        }
+                    ),
+                    metadata: Default::default(),
+                    finalizers: Default::default(),
+                    uncompressed_size: 1,
+                })
+                .await
+                .unwrap();
+            
+            if let BigqueryResponseBody::BatchCommitWriteStreams(result) = response.body {
+                assert_eq!(0, result.stream_errors.len());
+            } else {
+                panic!("Expected BatchCommitWriteStreams response");
+            }
+            
+            service
+        });
+        
+        // Clean everything up
+        let service = create_future.await.unwrap();
+        shutdown.send(()).unwrap();
         server_future.await.unwrap();
     }
 }
