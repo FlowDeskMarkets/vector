@@ -2216,9 +2216,9 @@ dependencies = [
 
 [[package]]
 name = "cidr"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d18b093eba54c9aaa1e3784d4361eb2ba944cf7d0a932a830132238f483e8d8"
+checksum = "6bdf600c45bd958cf2945c445264471cca8b6c8e67bc87b71affd6d7e5682621"
 
 [[package]]
 name = "cidr"
@@ -2232,7 +2232,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25c0a9fb70c2c2cc2a520aa259b1d1345650046a07df1b6da1d3cefcd327f43e"
 dependencies = [
- "cidr 0.2.2",
+ "cidr 0.2.3",
  "num-bigint",
  "num-traits",
 ]
@@ -11830,7 +11830,7 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 [[package]]
 name = "vrl"
 version = "0.22.0"
-source = "git+https://github.com/FlowdeskMarkets/vrl?branch=v0.22.0-flowdesk#6f9173f153dec3f30a988a957707e74e0ab25d23"
+source = "git+https://github.com/FlowdeskMarkets/vrl?branch=v0.22.0-flowdesk-rc.1#debfa2ecdc96a190bdc25e7496567e6f53e80cb7"
 dependencies = [
  "aes",
  "aes-siv",
