@@ -258,24 +258,27 @@ fn process_vrl(query_str: &str) -> Option<String> {
 #[typetag::serde(name = "http_client")]
 impl SourceConfig for HttpClientConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
-        let mut processed_query = self.query.clone();
-        for (param_name, query_value) in self.query.iter() {
-            match query_value {
-                QueryParameterValue::SingleParam(param) => {
-                    self.process_single_param(param_name, param, &mut processed_query);
-                }
-                QueryParameterValue::MultiParams(params) => {
-                    self.process_multi_params(param_name, params, &mut processed_query);
-                }
-            }
-        }
+        // Check if we have any VRL expressions in the query parameters
+        let has_vrl_expressions = self.query.iter().any(|(_, value)| match value {
+            QueryParameterValue::SingleParam(param) => RE.is_match(param),
+            QueryParameterValue::MultiParams(params) => params.iter().any(|p| RE.is_match(p)),
+        });
 
-        // Build the URL with the processed query parameters
+        // Build the base URLs
         let endpoints = [self.endpoint.clone()];
-        let urls = endpoints
+        let urls: Vec<Uri> = endpoints
             .iter()
             .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
-            .map(|r| r.map(|uri| build_url(&uri, &processed_query)))
+            .map(|r| {
+                if has_vrl_expressions {
+                    // For URLs with VRL expressions, don't add query parameters here
+                    // They'll be added dynamically during the HTTP request
+                    r
+                } else {
+                    // For URLs without VRL expressions, add query parameters now
+                    r.map(|uri| build_url(&uri, &self.query))
+                }
+            })
             .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
 
         let tls = TlsSettings::from_options(self.tls.as_ref())?;
@@ -287,10 +290,15 @@ impl SourceConfig for HttpClientConfig {
 
         let content_type = self.decoding.content_type(&self.framing).to_string();
 
-        // the only specific context needed is the codec decoding
+        // Create context with the config for dynamic query parameter evaluation
         let context = HttpClientContext {
             decoder,
             log_namespace,
+            config: if has_vrl_expressions {
+                Some(self.clone())
+            } else {
+                None
+            },
         };
 
         warn_if_interval_too_low(self.timeout, self.interval);
@@ -340,49 +348,6 @@ impl HttpClientConfig {
 
         DecodingConfig::new(framing, decoding, log_namespace)
     }
-
-    fn process_single_param(
-        &self,
-        param_name: &str,
-        param: &str,
-        processed_query: &mut HashMap<String, QueryParameterValue>,
-    ) {
-        let processed_param = self.parse_param(param);
-        processed_query.insert(
-            param_name.to_string(),
-            QueryParameterValue::SingleParam(processed_param),
-        );
-    }
-
-    fn process_multi_params(
-        &self,
-        param_name: &str,
-        params: &[String],
-        processed_query: &mut HashMap<String, QueryParameterValue>,
-    ) {
-        let processed_params: Vec<String> =
-            params.iter().map(|param| self.parse_param(param)).collect();
-
-        processed_query.insert(
-            param_name.to_string(),
-            QueryParameterValue::MultiParams(processed_params),
-        );
-    }
-
-    /// Resolve any VRL expressions in the parameter, if they exist
-    fn parse_param(&self, param: &str) -> String {
-        let mut parsed_param = param.to_string();
-
-        if let Some(cap) = RE.captures(param) {
-            if let Some(vrl_expr) = cap.name("key") {
-                let query_str = process_vrl(vrl_expr.as_str())
-                    .unwrap_or_else(|| panic!("Failed to process VRL in query parameter"));
-
-                parsed_param = parsed_param.replace(&cap[0], &query_str);
-            }
-        }
-        parsed_param
-    }
 }
 
 /// Captures the configuration options required to decode the incoming requests into events.
@@ -390,6 +355,10 @@ impl HttpClientConfig {
 pub struct HttpClientContext {
     pub decoder: Decoder,
     pub log_namespace: LogNamespace,
+    /// The original config is stored for dynamic query parameter evaluation
+    /// This is used to evaluate VRL expressions like {{ now() }} on each request
+    /// rather than just once during initialization
+    config: Option<HttpClientConfig>,
 }
 
 impl HttpClientContext {
@@ -425,6 +394,26 @@ impl HttpClientBuilder for HttpClientContext {
     }
 }
 
+/// Process any VRL expressions in query parameters
+fn process_query_value(value: &QueryParameterValue) -> QueryParameterValue {
+    match value {
+        QueryParameterValue::SingleParam(param) => {
+            QueryParameterValue::SingleParam(process_param(param))
+        }
+        QueryParameterValue::MultiParams(params) => process_multi_params(params),
+    }
+}
+
+fn process_param(param: &str) -> String {
+    process_vrl(param)
+        .filter(|_| RE.is_match(param))
+        .unwrap_or_else(|| param.to_string())
+}
+
+fn process_multi_params(params: &[String]) -> QueryParameterValue {
+    QueryParameterValue::MultiParams(params.iter().map(|param| process_param(param)).collect())
+}
+
 impl http_client::HttpClientContext for HttpClientContext {
     /// Decodes the HTTP response body into events per the decoder configured.
     fn on_response(&mut self, _url: &Uri, _header: &Parts, body: &Bytes) -> Option<Vec<Event>> {
@@ -435,6 +424,51 @@ impl http_client::HttpClientContext for HttpClientContext {
         let events = self.decode_events(&mut buf);
 
         Some(events)
+    }
+
+    /// Process the URL dynamically before each request
+    fn process_url(&self, url: &Uri) -> Option<Uri> {
+        // If we don't have a config, it means the query doesn't have any VRL parameters,
+        // so we can short-circuit here and just use the original URL
+        let config: &HttpClientConfig = self.config.as_ref()?;
+
+        let mut processed_query = HashMap::new();
+        let mut has_dynamic_params = false;
+
+        // Process query parameters for each request
+        for (param_name, query_value) in &config.query {
+            let processed_value = process_query_value(query_value);
+
+            // Check if any parameters were modified
+            if processed_value != *query_value {
+                has_dynamic_params = true;
+            }
+
+            // Store the processed query parameter
+            processed_query.insert(param_name.to_string(), processed_value);
+        }
+
+        if has_dynamic_params {
+            // Extract the base URI without query parameters to avoid parameter duplication
+            let base_uri = Uri::builder()
+                .scheme(
+                    url.scheme()
+                        .cloned()
+                        .unwrap_or_else(|| http::uri::Scheme::try_from("http").unwrap()),
+                )
+                .authority(
+                    url.authority()
+                        .cloned()
+                        .unwrap_or_else(|| http::uri::Authority::try_from("localhost").unwrap()),
+                )
+                .path_and_query(url.path().to_string())
+                .build()
+                .ok()?;
+
+            Some(build_url(&base_uri, &processed_query))
+        } else {
+            None
+        }
     }
 
     /// Enriches events with source_type, timestamp
