@@ -51,7 +51,7 @@ impl InternalEvent for WsConnectionFailedError {
     }
 
     fn name(&self) -> Option<&'static str> {
-        Some("WsConnectionFailed")
+        Some("WsConnectionFailedError")
     }
 }
 
